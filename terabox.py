@@ -1,149 +1,196 @@
-import os, time, math, asyncio, logging, urllib.parse
+import os
+import urllib.parse
+import asyncio
 from datetime import datetime
-from threading import Thread
-from flask import Flask, render_template
-from aria2p import API as Aria2API, Client as Aria2Client
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
-from pyrogram.enums import ChatMemberStatus
-from pyrogram.errors import FloodWait
 
-# Load env and configure
-from dotenv import load_dotenv
-load_dotenv('config.env', override=True)
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+# Make sure aria2 and ffmpeg are installed and accessible in PATH
 
-# Telegram & Aria2 setup
-aria2 = Aria2API(Aria2Client(host="http://localhost", port=6800, secret=""))
-aria2.set_global_options({"max-tries":"50","retry-wait":"3","continue":"true","allow-overwrite":"true","min-split-size":"4M","split":"10"})
+# Replace with your actual aria2 client instance
+aria2 = ...  
 
-API_ID, API_HASH, BOT_TOKEN = os.getenv('TELEGRAM_API'), os.getenv('TELEGRAM_HASH'), os.getenv('BOT_TOKEN')
-DUMP_CHAT_ID, FSUB_ID = int(os.getenv('DUMP_CHAT_ID')), int(os.getenv('FSUB_ID'))
-USER_SESSION_STRING = os.getenv('USER_SESSION_STRING')
-SPLIT_SIZE = 4_241_280_205 if USER_SESSION_STRING else 2_093_796_556
+def format_size(size):
+    # Format bytes as human-readable text
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
 
-app = Client("jetbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-user = Client("jetu", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION_STRING) if USER_SESSION_STRING else None
-
-VALID_DOMAINS = ['terabox.com','nephobox.com','4funbox.com','mirrobox.com',... ]  # same as before
-
-# Semaphore to limit simultaneous downloads
-semaphore = asyncio.Semaphore(3)
-
-# Utilities
 def is_valid_url(url):
-    from urllib.parse import urlparse
-    net = urlparse(url).netloc
-    return any(net.endswith(d) for d in VALID_DOMAINS)
+    return url.startswith("http://") or url.startswith("https://")
 
-def format_size(sz):
-    for unit in ['B','KB','MB','GB','TB']:
-        if sz < 1024.0:
-            return f"{sz:.2f} {unit}"
-        sz /= 1024.0
-    return f"{sz:.2f} PB"
+async def split_video_with_ffmpeg(input_path, duration_per_part, output_pattern):
+    import subprocess
+    import shlex
 
-async def is_user_member(client, user_id):
+    proc = await asyncio.create_subprocess_exec(
+        'ffmpeg', '-y', '-i', input_path,
+        '-c', 'copy', '-map', '0',
+        '-segment_time', str(duration_per_part),
+        '-f', 'segment',
+        output_pattern,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {stderr.decode()}")
+
+@Client.on_message(filters.private & filters.command("start"))
+async def start(client: Client, message: Message):
+    user_mention = message.from_user.mention
+    welcome_text = (
+        f"👋 **Welcome, {user_mention}!**\n\n"
+        "⭐ I am a Terabox Downloader Bot.\n"
+        "Send me any Terabox link and I'll download it and send you the file here!\n\n"
+        "🚀 Join our channel for updates and support."
+    )
+    await message.reply_text(welcome_text, parse_mode="Markdown")
+
+@Client.on_message(filters.private & filters.text)
+async def handle_message(client: Client, message: Message):
+    user_id = message.from_user.id
+    user_mention = message.from_user.mention
+
+    # Find a URL in the message
+    url = None
+    for word in message.text.split():
+        if is_valid_url(word):
+            url = word
+            break
+
+    if not url:
+        await message.reply_text("❌ Please provide a valid Terabox link.")
+        return
+
+    encoded_url = urllib.parse.quote(url)
+    final_url = f"https://teradlrobot.cheemsbackup.workers.dev/?url={encoded_url}"
+
     try:
-        m = await client.get_chat_member(FSUB_ID, user_id)
-        return m.status in [ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER]
-    except:
-        return False
+        # Add download
+        download = aria2.add_uris([final_url])
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to add download: {e}")
+        return
 
-# UI Progress bar
-def progress_bar(pct):
-    full = int(pct / 10)
-    return "🟩" * full + "⬜" * (10 - full)
+    status_message = await message.reply_text("⏳ Starting download...", parse_mode="Markdown")
 
-# Telegram handlers
-@app.on_message(filters.command("start"))
-async def start_cmd(_, msg: Message):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💌 Join", url="https://t.me/jetmirror")],
-        [InlineKeyboardButton("⚙️ Dev", url="https://t.me/rtx5069"), InlineKeyboardButton("🌐 Repo", url="https://github.com/...")]
-    ])
-    txt = f"👋 Hello {msg.from_user.mention}, send me a Terabox link to download."
-    if os.path.exists("/app/Jet-Mirror.mp4"):
-        await msg.reply_video("/app/Jet-Mirror.mp4", caption=txt, reply_markup=kb)
-    else:
-        await msg.reply(txt, reply_markup=kb)
+    start_time = datetime.now()
+    last_update_time = datetime.min
 
-@app.on_message(filters.text & ~filters.command)
-async def handle_msg(client: Client, message: Message):
-    async with semaphore:
-        user_id = message.from_user.id
-        if not await is_user_member(client, user_id):
-            return await message.reply("🔒 You must join the channel first.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join", url="https://t.me/jetmirror")]]))
+    # Show typing status while downloading
+    await client.send_chat_action(message.chat.id, "upload_document")
 
-        # extract valid URL
-        url = next((w for w in message.text.split() if is_valid_url(w)), None)
-        if not url:
-            return await message.reply("❌ Provide a valid Terabox link.")
-        
-        status = await message.reply("🚀 Starting download...")
-        download = aria2.add_uris([f"https://teradlrobot.cheemsbackup.workers.dev/?url={urllib.parse.quote(url)}"])
+    while not download.is_complete:
+        if download.is_removed or getattr(download, "error_message", None):
+            await status_message.edit_text(f"❌ Download failed: {getattr(download, 'error_message', 'Unknown error')}")
+            return
 
-        start = datetime.now()
-        while not download.is_complete:
-            await asyncio.sleep(8)
+        now = datetime.now()
+        # Update status every 15 seconds
+        if (now - last_update_time).seconds >= 15:
             download.update()
-            pct = download.progress
-            bar = progress_bar(pct)
-            await safe_edit(status, f"{bar} {pct:.2f}% • {format_size(download.completed_length)}/{format_size(download.total_length)} • ↓{format_size(download.download_speed)}/s")
-        
-        file_path = download.files[0].path
-        elapsed = datetime.now() - start
 
-        # handle splitting & upload
-        await upload_file(client, message, status, download.name, file_path, elapsed)
+            progress = download.progress or 0
+            elapsed_time = now - start_time
+            elapsed_minutes, elapsed_seconds = divmod(elapsed_time.seconds, 60)
 
-        await safe_delete(status)
-        await safe_delete(message)
+            progress_bar = "█" * int(progress // 10) + "░" * (10 - int(progress // 10))
 
-async def safe_edit(msg, txt):
-    try: await msg.edit(txt)
-    except FloodWait as e: await asyncio.sleep(e.value); await safe_edit(msg, txt)
-    except: pass
-
-async def safe_delete(msg):
-    try: await msg.delete()
-    except: pass
-
-async def upload_file(client, message, status, filename, path, elapsed):
-    size = os.path.getsize(path)
-    parts = math.ceil(size / SPLIT_SIZE)
-
-    async def upload(src):
-        return await (user.send_video if user else client.send_video)(DUMP_CHAT_ID, src, caption=filename, progress=lambda c, t: asyncio.ensure_future(
-            safe_edit(status, f"⬆️ {progress_bar(c/t*100)} {c/t*100:.2f}% • {format_size(c)}/{format_size(t)}")
-        ))
-
-    if parts > 1:
-        # Splitting using ffmpeg
-        for i in range(parts):
-            out = f"{path}.{i+1:03d}"
-            await safe_edit(status, f"✂️ Splitting part {i+1}/{parts}")
-            await asyncio.create_subprocess_exec(
-                'ffmpeg', '-y', '-i', path, '-ss', str(i*size/parts), '-t', str(size/parts),
-                '-c','copy', out
+            status_text = (
+                f"📥 **Downloading:** `{download.name}`\n"
+                f"🔹 Progress: [{progress_bar}] {progress:.2f}%\n"
+                f"🔹 Size: {format_size(download.completed_length or 0)} / {format_size(download.total_length or 0)}\n"
+                f"⏳ Speed: {format_size(download.download_speed or 0)}/s\n"
+                f"⌛ ETA: {download.eta or 'N/A'} | Elapsed: {elapsed_minutes}m {elapsed_seconds}s\n"
+                f"👤 User: [{user_mention}](tg://user?id={user_id}) | ID: `{user_id}`"
             )
-            sent = await upload(out)
-            await client.send_copy(message.chat.id, DUMP_CHAT_ID, sent.message_id)
-            os.remove(out)
-    else:
-        sent = await upload(path)
-        await client.send_video(message.chat.id, sent.video.file_id, caption=f"✅ Done: {filename}\n⏱ {elapsed.seconds//60}m {elapsed.seconds%60}s")
-    os.remove(path)
 
-# Keepalive server
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def home(): return render_template("index.html")
-def run_flask(): flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
-def keep_alive(): Thread(target=run_flask, daemon=True).start()
+            # Add cancel button
+            cancel_button = InlineKeyboardButton("Cancel ⛔️", callback_data=f"cancel_{download.gid}")
+            reply_markup = InlineKeyboardMarkup([[cancel_button]])
 
-if __name__ == "__main__":
-    keep_alive()
-    if user:
-        Thread(target=lambda: user.run(), daemon=True).start()
-    app.run()
+            await status_message.edit_text(status_text, reply_markup=reply_markup, parse_mode="Markdown")
+            last_update_time = now
+
+        await asyncio.sleep(5)
+
+    # Download completed
+    file_path = download.files[0].path if download.files else None
+    if not file_path or not os.path.exists(file_path):
+        await status_message.edit_text("❌ Downloaded file not found.")
+        return
+
+    await status_message.edit_text(f"✅ Download completed: `{os.path.basename(file_path)}`\n⏳ Preparing to upload...", parse_mode="Markdown")
+
+    # Check file size and split if needed (example: split if >1GB)
+    max_size = 1 * 1024 * 1024 * 1024  # 1GB
+    if os.path.getsize(file_path) > max_size:
+        await status_message.edit_text("⚠️ File is large, splitting into parts...")
+        # Split file into 500MB parts with ffmpeg (for video) or split binary for other types
+        # Here just an example with ffmpeg for video:
+        duration_per_part = 600  # 10 minutes parts
+        output_pattern = file_path + "_part%03d.mp4"
+
+        try:
+            await split_video_with_ffmpeg(file_path, duration_per_part, output_pattern)
+        except Exception as e:
+            await status_message.edit_text(f"❌ Failed to split video: {e}")
+            return
+
+        # Upload parts one by one
+        part_index = 0
+        while True:
+            part_file = file_path + f"_part{part_index:03d}.mp4"
+            if not os.path.exists(part_file):
+                break
+
+            await status_message.edit_text(f"⏳ Uploading part {part_index + 1}...")
+
+            try:
+                await client.send_document(message.chat.id, part_file, caption=f"Part {part_index + 1} of split video")
+            except Exception as e:
+                await status_message.edit_text(f"❌ Failed to upload part {part_index + 1}: {e}")
+                return
+
+            try:
+                os.remove(part_file)
+            except Exception:
+                pass
+            part_index += 1
+
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+        await status_message.edit_text("✅ All parts uploaded successfully!")
+        return
+
+    # File size < max, upload directly
+    await status_message.edit_text("⏳ Uploading file...")
+    try:
+        await client.send_document(message.chat.id, file_path, caption=f"Here is your file, {user_mention}")
+    except Exception as e:
+        await status_message.edit_text(f"❌ Upload failed: {e}")
+        return
+
+    try:
+        os.remove(file_path)
+    except Exception:
+        pass
+
+    await status_message.edit_text("✅ Upload completed successfully!")
+
+@Client.on_callback_query(filters.regex(r"cancel_"))
+async def cancel_download(client, callback_query):
+    gid = callback_query.data.split("_", 1)[1]
+    try:
+        aria2.remove(gid)
+        await callback_query.answer("❌ Download cancelled.", show_alert=True)
+        await callback_query.message.edit_text("❌ Download cancelled by user.")
+    except Exception as e:
+        await callback_query.answer(f"Error cancelling: {e}", show_alert=True)
