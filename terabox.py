@@ -1,52 +1,39 @@
-import os
-import math
-import time
+from aria2p import API as Aria2API, Client as Aria2Client
 import asyncio
-import logging
-import urllib.parse
+from dotenv import load_dotenv
 from datetime import datetime
-from threading import Thread
-from urllib.parse import urlparse
-
+import os
+import logging
+import math
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import FloodWait
-
-from aria2p import API as Aria2API, Client as Aria2Client
-from dotenv import load_dotenv
+import time
+import urllib.parse
+from urllib.parse import urlparse
 from flask import Flask, render_template
+from threading import Thread
 
-
-# Load environment variables from config.env
 load_dotenv('config.env', override=True)
-
-# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  
     format="[%(asctime)s - %(name)s - %(levelname)s] %(message)s - %(filename)s:%(lineno)d"
 )
+
 logger = logging.getLogger(__name__)
 
-# Reduce Pyrogram debug logging noise
 logging.getLogger("pyrogram.session").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.connection").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.dispatcher").setLevel(logging.ERROR)
 
-# Aria2 RPC connection details from environment (support Koyeb or custom host/port)
-ARIA2_HOST = os.environ.get('ARIA2_HOST', 'http://localhost')
-ARIA2_PORT = int(os.environ.get('ARIA2_PORT', 6800))
-ARIA2_SECRET = os.environ.get('ARIA2_SECRET', '')
-
 aria2 = Aria2API(
     Aria2Client(
-        host=ARIA2_HOST,
-        port=ARIA2_PORT,
-        secret=ARIA2_SECRET
+        host="http://localhost",
+        port=6800,
+        secret=""
     )
 )
-
-# Set global Aria2 options
 options = {
     "max-tries": "50",
     "retry-wait": "3",
@@ -55,119 +42,113 @@ options = {
     "min-split-size": "4M",
     "split": "10"
 }
+
 aria2.set_global_options(options)
 
-# Required environment variables
-API_ID = os.environ.get('TELEGRAM_API', '')
-API_HASH = os.environ.get('TELEGRAM_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-DUMP_CHAT_ID = os.environ.get('DUMP_CHAT_ID', '')
-FSUB_ID = os.environ.get('FSUB_ID', '')
-USER_SESSION_STRING = os.environ.get('USER_SESSION_STRING', None)
+API_ID = os.environ.get('TELEGRAM_API', '17627887')
+if len(API_ID) == 0:
+    logging.error("TELEGRAM_API variable is missing! Exiting now")
+    exit(1)
 
-# Validation for required vars
-def validate_env_var(name, val):
-    if not val:
-        logger.error(f"{name} variable is missing! Exiting now")
-        exit(1)
+API_HASH = os.environ.get('TELEGRAM_HASH', 'd14e54b0791ca1f8b0f26786439e336e')
+if len(API_HASH) == 0:
+    logging.error("TELEGRAM_HASH variable is missing! Exiting now")
+    exit(1)
+    
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '7305366063:AAFXCw564Nc8pIynO-48zoCtZPV1eyqcPaY')
+if len(BOT_TOKEN) == 0:
+    logging.error("BOT_TOKEN variable is missing! Exiting now")
+    exit(1)
 
-validate_env_var('TELEGRAM_API', API_ID)
-validate_env_var('TELEGRAM_HASH', API_HASH)
-validate_env_var('BOT_TOKEN', BOT_TOKEN)
-validate_env_var('DUMP_CHAT_ID', DUMP_CHAT_ID)
-validate_env_var('FSUB_ID', FSUB_ID)
+DUMP_CHAT_ID = os.environ.get('DUMP_CHAT_ID', '-1002378462710')
+if len(DUMP_CHAT_ID) == 0:
+    logging.error("DUMP_CHAT_ID variable is missing! Exiting now")
+    exit(1)
+else:
+    DUMP_CHAT_ID = int(DUMP_CHAT_ID)
 
-DUMP_CHAT_ID = int(DUMP_CHAT_ID)
-FSUB_ID = int(FSUB_ID)
+FSUB_ID = os.environ.get('FSUB_ID', '-1001835578380')
+if len(FSUB_ID) == 0:
+    logging.error("FSUB_ID variable is missing! Exiting now")
+    exit(1)
+else:
+    FSUB_ID = int(FSUB_ID)
 
-# Initialize Pyrogram clients
+USER_SESSION_STRING = os.environ.get('USER_SESSION_STRING', '')
+if len(USER_SESSION_STRING) == 0:
+    logging.info("USER_SESSION_STRING variable is missing! Bot will split Files in 2Gb...")
+    USER_SESSION_STRING = None
+
 app = Client("jetbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 user = None
-SPLIT_SIZE = 2093796556  # ~2GB split size by default
+SPLIT_SIZE = 2093796556
 if USER_SESSION_STRING:
     user = Client("jetu", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION_STRING)
-    SPLIT_SIZE = 4241280205  # ~4GB if user session is provided
-else:
-    logger.info("USER_SESSION_STRING not provided, will split files at 2GB")
+    SPLIT_SIZE = 4241280205
 
-# Valid Terabox domains to check URLs against
 VALID_DOMAINS = [
-    'terabox.com', 'nephobox.com', '4funbox.com', 'mirrobox.com',
-    'momerybox.com', 'teraboxapp.com', '1024tera.com',
-    'terabox.app', 'gibibox.com', 'goaibox.com', 'terasharelink.com',
+    'terabox.com', 'nephobox.com', '4funbox.com', 'mirrobox.com', 
+    'momerybox.com', 'teraboxapp.com', '1024tera.com', 
+    'terabox.app', 'gibibox.com', 'goaibox.com', 'terasharelink.com', 
     'teraboxlink.com', 'terafileshare.com'
 ]
+last_update_time = 0
 
-# Utility: Check if user is member of the required Telegram channel
 async def is_user_member(client, user_id):
     try:
         member = await client.get_chat_member(FSUB_ID, user_id)
-        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            return True
+        else:
+            return False
     except Exception as e:
-        logger.error(f"Error checking membership for user {user_id}: {e}")
+        logging.error(f"Error checking membership status for user {user_id}: {e}")
         return False
-
-# Utility: Validate if URL belongs to valid Terabox domains
+    
 def is_valid_url(url):
-    try:
-        parsed_url = urlparse(url)
-        return any(parsed_url.netloc.endswith(domain) for domain in VALID_DOMAINS)
-    except Exception:
-        return False
+    parsed_url = urlparse(url)
+    return any(parsed_url.netloc.endswith(domain) for domain in VALID_DOMAINS)
 
-# Utility: Human-readable file size formatting
 def format_size(size):
     if size < 1024:
         return f"{size} B"
-    elif size < 1024 ** 2:
+    elif size < 1024 * 1024:
         return f"{size / 1024:.2f} KB"
-    elif size < 1024 ** 3:
-        return f"{size / (1024 ** 2):.2f} MB"
+    elif size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.2f} MB"
     else:
-        return f"{size / (1024 ** 3):.2f} GB"
+        return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
-# /start command handler with inline buttons and optional video
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     join_button = InlineKeyboardButton("ᴊᴏɪɴ ❤️🚀", url="https://t.me/jetmirror")
     developer_button = InlineKeyboardButton("ᴅᴇᴠᴇʟᴏᴘᴇʀ ⚡️", url="https://t.me/rtx5069")
-    repo_button = InlineKeyboardButton("ʀᴇᴘᴏ 🌐", url="https://github.com/Hrishi2861/Terabox-Downloader-Bot")
-
-    reply_markup = InlineKeyboardMarkup([[join_button, developer_button], [repo_button]])
-    user_mention = message.from_user.mention if message.from_user else "User"
-
-    welcome_text = (
-        f"ᴡᴇʟᴄᴏᴍᴇ, {user_mention}.\n\n"
-        "🌟 ɪ ᴀᴍ ᴀ ᴛᴇʀᴀʙᴏx ᴅᴏᴡɴʟᴏᴀᴅᴇʀ ʙᴏᴛ.\n"
-        "sᴇɴᴅ ᴍᴇ ᴀɴʏ ᴛᴇʀᴀʙᴏx ʟɪɴᴋ ᴀɴᴅ ɪ ᴡɪʟʟ ᴅᴏᴡɴʟᴏᴀᴅ ɪᴛ ᴀɴᴅ sᴇɴᴅ ɪᴛ ᴛᴏ ʏᴏᴜ ✨."
-    )
-
-    video_file_path = "/app/Jet-Mirror.mp4"
-    if os.path.exists(video_file_path):
+    repo69 = InlineKeyboardButton("ʀᴇᴘᴏ 🌐", url="https://github.com/Hrishi2861/Terabox-Downloader-Bot")
+    user_mention = message.from_user.mention
+    reply_markup = InlineKeyboardMarkup([[join_button, developer_button], [repo69]])
+    final_msg = f"ᴡᴇʟᴄᴏᴍᴇ, {user_mention}.\n\n🌟 ɪ ᴀᴍ ᴀ ᴛᴇʀᴀʙᴏx ᴅᴏᴡɴʟᴏᴀᴅᴇʀ ʙᴏᴛ. sᴇɴᴅ ᴍᴇ ᴀɴʏ ᴛᴇʀᴀʙᴏx ʟɪɴᴋ ɪ ᴡɪʟʟ ᴅᴏᴡɴʟᴏᴀᴅ ᴡɪᴛʜɪɴ ғᴇᴡ sᴇᴄᴏɴᴅs ᴀɴᴅ sᴇɴᴅ ɪᴛ ᴛᴏ ʏᴏᴜ ✨."
+    video_file_id = "/app/Jet-Mirror.mp4"
+    if os.path.exists(video_file_id):
         await client.send_video(
             chat_id=message.chat.id,
-            video=video_file_path,
-            caption=welcome_text,
+            video=video_file_id,
+            caption=final_msg,
             reply_markup=reply_markup
-        )
+            )
     else:
-        await message.reply_text(welcome_text, reply_markup=reply_markup)
+        await message.reply_text(final_msg, reply_markup=reply_markup)
 
-# Helper to safely update the status message with flood wait handling
 async def update_status_message(status_message, text):
     try:
         await status_message.edit_text(text)
-    except FloodWait as e:
-        logger.warning(f"FloodWait: sleeping for {e.value} seconds")
-        await asyncio.sleep(e.value)
-        await update_status_message(status_message, text)
     except Exception as e:
         logger.error(f"Failed to update status message: {e}")
 
-# Main message handler for text messages (not commands)
-@app.on_message(filters.text & (~filters.command))
+@app.on_message(filters.text)
 async def handle_message(client: Client, message: Message):
+    if message.text.startswith('/'):
+        return
     if not message.from_user:
         return
 
@@ -176,13 +157,10 @@ async def handle_message(client: Client, message: Message):
 
     if not is_member:
         join_button = InlineKeyboardButton("ᴊᴏɪɴ ❤️🚀", url="https://t.me/jetmirror")
-        await message.reply_text(
-            "ʏᴏᴜ ᴍᴜsᴛ ᴊᴏɪɴ ᴍʏ ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴜsᴇ ᴍᴇ.",
-            reply_markup=InlineKeyboardMarkup([[join_button]])
-        )
+        reply_markup = InlineKeyboardMarkup([[join_button]])
+        await message.reply_text("ʏᴏᴜ ᴍᴜsᴛ ᴊᴏɪɴ ᴍʏ ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴜsᴇ ᴍᴇ.", reply_markup=reply_markup)
         return
-
-    # Extract first valid Terabox URL from message
+    
     url = None
     for word in message.text.split():
         if is_valid_url(word):
@@ -193,87 +171,250 @@ async def handle_message(client: Client, message: Message):
         await message.reply_text("Please provide a valid Terabox link.")
         return
 
-    # Prepare final URL for aria2
-    encoded_url = urllib.parse.quote(url, safe='')
+    encoded_url = urllib.parse.quote(url)
     final_url = f"https://teradlrobot.cheemsbackup.workers.dev/?url={encoded_url}"
 
-    # Add download to aria2
     download = aria2.add_uris([final_url])
-    status_message = await message.reply_text("sᴇɴᴅɪɴɢ ʏᴏᴜ ᴛʜᴇ ᴍᴇssᴀɢᴇ...")
+    status_message = await message.reply_text("sᴇɴᴅɪɴɢ ʏᴏᴜ ᴛʜᴇ ᴍᴇᴅɪᴀ...🤤")
 
-    def download_status_thread():
+    start_time = datetime.now()
+
+    while not download.is_complete:
+        await asyncio.sleep(15)
+        download.update()
+        progress = download.progress
+
+        elapsed_time = datetime.now() - start_time
+        elapsed_minutes, elapsed_seconds = divmod(elapsed_time.seconds, 60)
+
+        status_text = (
+            f"┏ ғɪʟᴇɴᴀᴍᴇ: {download.name}\n"
+            f"┠ [{'★' * int(progress / 10)}{'☆' * (10 - int(progress / 10))}] {progress:.2f}%\n"
+            f"┠ ᴘʀᴏᴄᴇssᴇᴅ: {format_size(download.completed_length)} ᴏғ {format_size(download.total_length)}\n"
+            f"┠ sᴛᴀᴛᴜs: 📥 Downloading\n"
+            f"┠ ᴇɴɢɪɴᴇ: <b><u>Aria2c v1.37.0</u></b>\n"
+            f"┠ sᴘᴇᴇᴅ: {format_size(download.download_speed)}/s\n"
+            f"┠ ᴇᴛᴀ: {download.eta} | ᴇʟᴀᴘsᴇᴅ: {elapsed_minutes}m {elapsed_seconds}s\n"
+            f"┖ ᴜsᴇʀ: <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> | ɪᴅ: {user_id}\n"
+            )
+        while True:
+            try:
+                await update_status_message(status_message, status_text)
+                break
+            except FloodWait as e:
+                logger.error(f"Flood wait detected! Sleeping for {e.value} seconds")
+                await asyncio.sleep(e.value)
+
+    file_path = download.files[0].path
+    caption = (
+        f"✨ {download.name}\n"
+        f"👤 ʟᴇᴇᴄʜᴇᴅ ʙʏ : <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a>\n"
+        f"📥 ᴜsᴇʀ ʟɪɴᴋ: tg://user?id={user_id}\n\n"
+        "[ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴊᴇᴛ-ᴍɪʀʀᴏʀ ❤️🚀](https://t.me/JetMirror)"
+    )
+
+    last_update_time = time.time()
+    UPDATE_INTERVAL = 15
+
+    async def update_status(message, text):
+        nonlocal last_update_time
+        current_time = time.time()
+        if current_time - last_update_time >= UPDATE_INTERVAL:
+            try:
+                await message.edit_text(text)
+                last_update_time = current_time
+            except FloodWait as e:
+                logger.warning(f"FloodWait: Sleeping for {e.value}s")
+                await asyncio.sleep(e.value)
+                await update_status(message, text)
+            except Exception as e:
+                logger.error(f"Error updating status: {e}")
+
+    async def upload_progress(current, total):
+        progress = (current / total) * 100
+        elapsed_time = datetime.now() - start_time
+        elapsed_minutes, elapsed_seconds = divmod(elapsed_time.seconds, 60)
+
+        status_text = (
+            f"┏ ғɪʟᴇɴᴀᴍᴇ: {download.name}\n"
+            f"┠ [{'★' * int(progress / 10)}{'☆' * (10 - int(progress / 10))}] {progress:.2f}%\n"
+            f"┠ ᴘʀᴏᴄᴇssᴇᴅ: {format_size(current)} ᴏғ {format_size(total)}\n"
+            f"┠ sᴛᴀᴛᴜs: 📤 Uploading to Telegram\n"
+            f"┠ ᴇɴɢɪɴᴇ: <b><u>PyroFork v2.2.11</u></b>\n"
+            f"┠ sᴘᴇᴇᴅ: {format_size(current / elapsed_time.seconds if elapsed_time.seconds > 0 else 0)}/s\n"
+            f"┠ ᴇʟᴀᴘsᴇᴅ: {elapsed_minutes}m {elapsed_seconds}s\n"
+            f"┖ ᴜsᴇʀ: <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> | ɪᴅ: {user_id}\n"
+        )
+        await update_status(status_message, status_text)
+
+    async def split_video_with_ffmpeg(input_path, output_prefix, split_size):
         try:
-            while True:
-                try:
-                    aria2.load()  # Refresh aria2 status
-                    info = aria2.get_download(download.gid)
-                except Exception:
-                    # Download might be removed or error occurred
-                    break
-
-                # Prepare status text
-                size_total = info.total_length
-                size_downloaded = info.completed_length
-                progress = size_downloaded / size_total if size_total > 0 else 0
-                percent = progress * 100
-
-                speed = info.download_speed or 0
-                eta = (size_total - size_downloaded) / speed if speed > 0 else 0
-                eta_str = time.strftime('%H:%M:%S', time.gmtime(eta))
-
-                status_text = (
-                    f"📥 **Downloading...**\n"
-                    f"🗂️ File: {info.name}\n"
-                    f"⬇️ {format_size(size_downloaded)} / {format_size(size_total)} ({percent:.2f}%)\n"
-                    f"🚀 Speed: {format_size(speed)}/s\n"
-                    f"⏳ ETA: {eta_str}\n"
-                    f"⚙️ Status: {info.status}"
-                )
-
-                # Update status message asynchronously
-                asyncio.run_coroutine_threadsafe(update_status_message(status_message, status_text), client.loop)
-
-                if info.is_complete or info.status == "complete":
-                    # Download complete
-                    # Here you can do post-processing, e.g., upload to Telegram
-                    # For now just send a completion message
-                    asyncio.run_coroutine_threadsafe(
-                        status_message.reply_text(f"Download complete!\nFile name: {info.name}"),
-                        client.loop
+            original_ext = os.path.splitext(input_path)[1].lower() or '.mp4'
+            start_time = datetime.now()
+            last_progress_update = time.time()
+            
+            proc = await asyncio.create_subprocess_exec(
+                'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1', input_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            total_duration = float(stdout.decode().strip())
+            
+            file_size = os.path.getsize(input_path)
+            parts = math.ceil(file_size / split_size)
+            
+            if parts == 1:
+                return [input_path]
+            
+            duration_per_part = total_duration / parts
+            split_files = []
+            
+            for i in range(parts):
+                current_time = time.time()
+                if current_time - last_progress_update >= UPDATE_INTERVAL:
+                    elapsed = datetime.now() - start_time
+                    status_text = (
+                        f"✂️ Splitting {os.path.basename(input_path)}\n"
+                        f"Part {i+1}/{parts}\n"
+                        f"Elapsed: {elapsed.seconds // 60}m {elapsed.seconds % 60}s"
                     )
-                    break
-
-                time.sleep(3)
+                    await update_status(status_message, status_text)
+                    last_progress_update = current_time
+                
+                output_path = f"{output_prefix}.{i+1:03d}{original_ext}"
+                cmd = [
+                    'xtra', '-y', '-ss', str(i * duration_per_part),
+                    '-i', input_path, '-t', str(duration_per_part),
+                    '-c', 'copy', '-map', '0',
+                    '-avoid_negative_ts', 'make_zero',
+                    output_path
+                ]
+                
+                proc = await asyncio.create_subprocess_exec(*cmd)
+                await proc.wait()
+                split_files.append(output_path)
+            
+            return split_files
         except Exception as e:
-            logger.error(f"Error in download status thread: {e}")
+            logger.error(f"Split error: {e}")
+            raise
 
-    # Run download status in a background thread so main loop is free
-    Thread(target=download_status_thread, daemon=True).start()
+    async def handle_upload():
+        file_size = os.path.getsize(file_path)
+        
+        if file_size > SPLIT_SIZE:
+            await update_status(
+                status_message,
+                f"✂️ Splitting {download.name} ({format_size(file_size)})"
+            )
+            
+            split_files = await split_video_with_ffmpeg(
+                file_path,
+                os.path.splitext(file_path)[0],
+                SPLIT_SIZE
+            )
+            
+            try:
+                for i, part in enumerate(split_files):
+                    part_caption = f"{caption}\n\nPart {i+1}/{len(split_files)}"
+                    await update_status(
+                        status_message,
+                        f"📤 Uploading part {i+1}/{len(split_files)}\n"
+                        f"{os.path.basename(part)}"
+                    )
+                    
+                    if USER_SESSION_STRING:
+                        sent = await user.send_video(
+                            DUMP_CHAT_ID, part, 
+                            caption=part_caption,
+                            progress=upload_progress
+                        )
+                        await app.copy_message(
+                            message.chat.id, DUMP_CHAT_ID, sent.id
+                        )
+                    else:
+                        sent = await client.send_video(
+                            DUMP_CHAT_ID, part,
+                            caption=part_caption,
+                            progress=upload_progress
+                        )
+                        await client.send_video(
+                            message.chat.id, sent.video.file_id,
+                            caption=part_caption
+                        )
+                    os.remove(part)
+            finally:
+                for part in split_files:
+                    try: os.remove(part)
+                    except: pass
+        else:
+            await update_status(
+                status_message,
+                f"📤 Uploading {download.name}\n"
+                f"Size: {format_size(file_size)}"
+            )
+            
+            if USER_SESSION_STRING:
+                sent = await user.send_video(
+                    DUMP_CHAT_ID, file_path,
+                    caption=caption,
+                    progress=upload_progress
+                )
+                await app.copy_message(
+                    message.chat.id, DUMP_CHAT_ID, sent.id
+                )
+            else:
+                sent = await client.send_video(
+                    DUMP_CHAT_ID, file_path,
+                    caption=caption,
+                    progress=upload_progress
+                )
+                await client.send_video(
+                    message.chat.id, sent.video.file_id,
+                    caption=caption
+                )
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-# Flask app for web (if needed)
+    start_time = datetime.now()
+    await handle_upload()
+
+    try:
+        await status_message.delete()
+        await message.delete()
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
-def index():
-    return "Jet-Mirror Bot is running!"
+def home():
+    return render_template("index.html")
 
-# Run both pyrogram client and flask app if required
-if __name__ == "__main__":
-    # Start user client if any
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+def keep_alive():
+    Thread(target=run_flask).start()
+
+async def start_user_client():
     if user:
-        user.start()
-        logger.info("User client started")
+        await user.start()
+        logger.info("User client started.")
 
-    # Start bot client
-    app.start()
-    logger.info("Bot client started")
+def run_user():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_user_client())
 
-    # Run flask app in a thread if needed
-    from threading import Thread
-    flask_thread = Thread(target=flask_app.run, kwargs={"host": "0.0.0.0", "port": 8080})
-    flask_thread.start()
+if __name__ == "__main__":
+    keep_alive()
 
-    # Idle the bot
-    print("Bot is running... Press Ctrl+C to stop.")
-    import signal
-    signal.pause()
+    if user:
+        logger.info("Starting user client...")
+        Thread(target=run_user).start()
+
+    logger.info("Starting bot client...")
+    app.run()
